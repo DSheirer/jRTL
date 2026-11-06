@@ -60,6 +60,24 @@ echo "=== librtlsdr $REF ==="
 git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$REF" "$RTLSDR_REPOSITORY" rtlsdr
 UPSTREAM_COMMIT="$(git -C rtlsdr rev-parse HEAD)"
 
+# jRTL's fixes to upstream, applied in name order. A patch that no longer
+# applies fails the build of the pinned ref. On upstream master it only warns,
+# because upstream may have taken the fix, and the build continues without it.
+PATCHES=""
+for patch in "$ROOT"/native/patches/*.patch; do
+    [ -e "$patch" ] || continue
+    name="$(basename "$patch")"
+    if git -C rtlsdr apply "$patch"; then
+        PATCHES="${PATCHES:+$PATCHES,}$name"
+        echo "Applied $name"
+    elif [ "$REF" = "$RTLSDR_REF" ]; then
+        echo "$name does not apply to $REF" >&2
+        exit 1
+    else
+        echo "::warning::$name does not apply to $REF; building without it"
+    fi
+done
+
 # Upstream finds libusb with pkg-config, which links by name and so cannot use
 # a libusb outside the default search path. Disabling it makes upstream take the
 # paths given here instead.
@@ -121,6 +139,7 @@ cp "libusb-$LIBUSB_VERSION/COPYING" "$ROOT/dist/native/licenses/libusb-COPYING"
 cat > "$OUT/build-info.properties" <<INFO
 rtlsdr.ref=$REF
 rtlsdr.commit=$UPSTREAM_COMMIT
+rtlsdr.patches=$PATCHES
 libusb.version=$LIBUSB_VERSION
 INFO
 ls -l "$OUT"

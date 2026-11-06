@@ -9,9 +9,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.dsheirer.rtlsdr.internal.Native;
 import io.github.dsheirer.rtlsdr.internal.NativeLibraryLoader;
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
 
 /** Tests that need the native library for the current platform but no hardware. */
@@ -29,6 +34,25 @@ class LibraryTest {
         BuildInfo info = RtlSdr.buildInfo();
         assertFalse(info.rtlSdrRef().equals("unknown"), info.toString());
         assertTrue(info.rtlSdrCommit().matches("[0-9a-f]{40}"), info.toString());
+    }
+
+    @Test
+    void recordsThePatchesApplied() throws IOException {
+        List<String> available;
+        try (Stream<Path> files = Files.list(Path.of("native", "patches"))) {
+            available = files.map(f -> f.getFileName().toString())
+                .filter(name -> name.endsWith(".patch")).sorted().toList();
+        }
+        String pinnedRef = Files.readAllLines(Path.of("native", "versions.env")).stream()
+            .filter(line -> line.startsWith("RTLSDR_REF=")).findFirst().orElseThrow()
+            .substring("RTLSDR_REF=".length());
+        BuildInfo info = RtlSdr.buildInfo();
+        // Builds of upstream master may skip a patch that no longer applies.
+        if (info.rtlSdrRef().equals(pinnedRef)) {
+            assertEquals(available, info.rtlSdrPatches(), info.toString());
+        } else {
+            assertTrue(available.containsAll(info.rtlSdrPatches()), info.toString());
+        }
     }
 
     @Test

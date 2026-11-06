@@ -3,7 +3,8 @@
 Java bindings for librtlsdr from [rtl-sdr-blog](https://github.com/rtlsdrblog/rtl-sdr-blog),
 the driver for RTL2832U-based software-defined radios such as the RTL-SDR Blog
 V3 and V4, built on the Java Foreign Function & Memory API. The jar contains the
-native libraries, so there is nothing else to install.
+native libraries, so there is nothing else to install. The bundled librtlsdr
+carries a small number of jRTL fixes; see [Patches](#patches).
 
 | OS | x86-64 | aarch64 |
 |---------|----|----|
@@ -102,6 +103,23 @@ pwsh native/build-windows.ps1 -Arch x64               # Windows; or -Arch ARM64
 
 A local jar contains only your platform. The hardware tests are receive-only.
 
+### Patches
+
+The build applies the patches in [`native/patches`](native/patches) to the
+upstream source, in name order, and records the ones it applied as
+`rtlsdr.patches` in `build-info.properties` and in `RtlSdr.buildInfo()`. A patch
+that no longer applies fails the build of the pinned version. The nightly build
+of upstream `master` warns and builds without it, since upstream may have taken
+the fix.
+
+| Patch | Fixes |
+|-------|-------|
+| `0001-pre-read-before-control-writes.patch` | `rtlsdr_demod_write_reg failed with -9` when a streaming device is changed after a pause, such as a retune, and `read_eeprom` failing while streaming. The RTL2832U stalls the first control write after about 100–300 ms without control traffic; a register read just before the write prevents it. |
+
+To add a patch, commit the change on top of the pinned tag in a clone of
+upstream and export it with `git format-patch -1 --zero-commit -o native/patches`,
+then rename it so that the names sort in the order to apply.
+
 ## Releases
 
 jRTL versions follow upstream: jRTL 1.4.0 wraps rtl-sdr-blog V1.4.0. The
@@ -116,16 +134,18 @@ is the only place the version is set.
 | Tag `vX.Y.Z` | Publishes a release built from the pinned upstream version |
 
 To release, tag the pinned version: `git tag v1.4.0 && git push origin v1.4.0`.
-The workflow rejects a tag that does not match the pin. For a Java-only fix on
-the same upstream version add a fourth number, such as `v1.4.0.1`; for a
-pre-release add a suffix, such as `v1.4.0-rc1`.
+The workflow rejects a tag that does not match the pin. For a jRTL fix on the
+same upstream version, in the Java code or a new native patch, add a fourth
+number, such as `v1.4.0.1`; for a pre-release add a suffix, such as `v1.4.0-rc1`.
 
 To adopt a new upstream release, change `RTLSDR_REF` and `RTLSDR_VERSION` in
 `native/versions.env`, which also moves the jRTL version. If upstream added
 functions, the build lists them; add them to `Native.java`.
 
 Every release and nightly also carries `rtl-sdr-blog-<ref>-source.tar.gz`, the
-exact source of the bundled librtlsdr, as its GPL license requires.
+exact source of the bundled librtlsdr, as its GPL license requires: the upstream
+commit with the jRTL patches applied, and the patch files in its `jrtl-patches`
+directory.
 
 ## License
 
