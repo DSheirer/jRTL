@@ -1,0 +1,81 @@
+# Publishes a release when a version tag is pushed, built from the upstream
+# version pinned in native/versions.env. The tag has to match that pin: v1.4.0,
+# v1.4.0.1 for a Java-only fix, or v1.4.0-rc1 for a pre-release.
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: version
+        run: |
+          source native/versions.env
+          case "$GITHUB_REF_NAME" in
+            "v$RTLSDR_VERSION" | "v$RTLSDR_VERSION".[0-9]* | "v$RTLSDR_VERSION"-*) ;;
+            *)
+              echo "::error::Tag $GITHUB_REF_NAME does not match pinned upstream $RTLSDR_VERSION"
+              exit 1
+              ;;
+          esac
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: native
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: jars
+          path: jars
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          main_jar="$(ls jars/jrtl-*.jar | grep -Ev -- '-(sources|javadoc)\.jar$')"
+          info="$(unzip -p "$main_jar" jrtl/native/linux-x86_64/build-info.properties)"
+          # librtlsdr is GPL: publish its exact source next to the binaries.
+          source native/versions.env
+          commit="$(sed -n 's/^rtlsdr.commit=//p' <<< "$info")"
+          git init -q upstream
+          git -C upstream fetch -q --depth 1 "$RTLSDR_REPOSITORY" "$commit"
+          git -C upstream archive --prefix="rtl-sdr-blog-$RTLSDR_REF/" \
+            -o "$PWD/jars/rtl-sdr-blog-$RTLSDR_REF-source.tar.gz" FETCH_HEAD
+          (cd jars && sha256sum * > SHA256SUMS)
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" jars/* "${prerelease[@]}" \
+            --verify-tag --generate-notes --title "jRTL ${GITHUB_REF_NAME#v}" \
+            --notes "Native library versions:
+
+          \`\`\`
+          $info
+          \`\`\`
+
+          \`rtl-sdr-blog-$RTLSDR_REF-source.tar.gz\` is the source of the bundled librtlsdr."
