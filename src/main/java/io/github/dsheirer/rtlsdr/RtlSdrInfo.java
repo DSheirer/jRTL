@@ -16,6 +16,9 @@ public final class RtlSdrInfo {
         BuildInfo build = RtlSdr.buildInfo();
         System.out.println("librtlsdr " + build.rtlSdrRef() + " (rtl-sdr-blog " + build.rtlSdrCommit()
             + "), libusb " + build.libusbVersion());
+        for (String patch : build.rtlSdrPatches()) {
+            System.out.println("  patched: " + patch);
+        }
         System.out.println("Devices found: " + devices.size());
         for (DeviceInfo info : devices) {
             UsbStrings usb = info.usbStrings();

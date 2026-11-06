@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: denny <dennis.sheirer@gmail.com>
+Date: Fri, 6 Nov 2026 09:11:38 -0500
+Subject: [PATCH] Read a register before control writes that can follow an idle
+ gap
+
+While the device is streaming, the RTL2832U stalls the first vendor OUT
+control transfer that follows roughly 100-300 ms without control
+traffic, and libusb reports LIBUSB_ERROR_PIPE (-9). Back-to-back
+transfers succeed. It shows as "rtlsdr_demod_write_reg failed with -9"
+when a streaming device is retuned, and the I2C repeater write that
+fails can take the tuner write after it with it. rtlsdr_read_eeprom
+fails with -3 every time while streaming.
+
+A vendor IN transfer just before the write prevents the stall. Read a
+demod register, the same one rtlsdr_demod_write_reg already reads after
+each write, before writes in rtlsdr_demod_write_reg and
+rtlsdr_write_reg, and at the start of the EEPROM functions.
+
+rtlsdr_write_array, which carries the tuner's I2C traffic, does not
+read first. Tuner access always starts with the I2C repeater write, and
+reading before every I2C write doubles the tuning time.
+
+Measured on an R820T dongle streaming at 2.4 MS/s. Lines reporting -9
+over 12 operations one second apart, and the mean time of each call
+made back to back:
+
+                   retune  gain  sample rate   set_center_freq  set_tuner_gain
+  unpatched          13     13       25            91 ms            38 ms
+  patched             0      0        0            96 ms            43 ms
+  read before every
+  write, for scale    0      0        0           186 ms            73 ms
+
+rtlsdr_read_eeprom while streaming: -3 every time unpatched, succeeds
+patched.
+---
+ src/librtlsdr.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/librtlsdr.c b/src/librtlsdr.c
+index 82bab6d..6d73514 100644
+--- a/src/librtlsdr.c
++++ b/src/librtlsdr.c
+@@ -405,6 +405,25 @@ enum blocks {
+ 	IICB			= 6,
+ };
+ 
++/*
++ * While the device is streaming, the RTL2832U stalls (LIBUSB_ERROR_PIPE) the
++ * first vendor OUT control transfer that follows roughly 100-300 ms without
++ * control traffic. A vendor IN transfer just before it prevents the stall, so
++ * the write paths that can follow an idle gap read a demod register first: the
++ * same register that rtlsdr_demod_write_reg already reads after each write.
++ *
++ * rtlsdr_write_array, which carries the tuner's I2C traffic, does not read
++ * first: tuner access always starts with the I2C repeater write, which is a
++ * demod write, and doubling the transfers would double the tuning time.
++ */
++static void rtlsdr_ctrl_wake(rtlsdr_dev_t *dev)
++{
++	unsigned char data;
++
++	libusb_control_transfer(dev->devh, CTRL_IN, 0, (0x01 << 8) | 0x20, 0x0a,
++				&data, 1, CTRL_TIMEOUT);
++}
++
+ int rtlsdr_read_array(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint8_t *array, uint8_t len)
+ {
+ 	int r;
+@@ -503,6 +522,7 @@ int rtlsdr_write_reg(rtlsdr_dev_t *dev, uint8_t block, uint16_t addr, uint16_t v
+ 
+ 	data[1] = val & 0xff;
+ 
++	rtlsdr_ctrl_wake(dev);
+ 	r = libusb_control_transfer(dev->devh, CTRL_OUT, 0, addr, index, data, len, CTRL_TIMEOUT);
+ 
+ 	if (r < 0)
+@@ -544,6 +564,7 @@ int rtlsdr_demod_write_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint1
+ 
+ 	data[1] = val & 0xff;
+ 
++	rtlsdr_ctrl_wake(dev);
+ 	r = libusb_control_transfer(dev->devh, CTRL_OUT, 0, addr, index, data, len, CTRL_TIMEOUT);
+ 
+ 	if (r < 0)
+@@ -833,6 +854,7 @@ int rtlsdr_write_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16
+ 	if ((len + offset) > 256)
+ 		return -2;
+ 
++	rtlsdr_ctrl_wake(dev);
+ 	for (i = 0; i < len; i++) {
+ 		cmd[0] = i + offset;
+ 		r = rtlsdr_write_array(dev, IICB, EEPROM_ADDR, cmd, 1);
+@@ -870,6 +892,7 @@ int rtlsdr_read_eeprom(rtlsdr_dev_t *dev, uint8_t *data, uint8_t offset, uint16_
+ 	if ((len + offset) > 256)
+ 		return -2;
+ 
++	rtlsdr_ctrl_wake(dev);
+ 	r = rtlsdr_write_array(dev, IICB, EEPROM_ADDR, &offset, 1);
+ 	if (r < 0)
+ 		return -3;

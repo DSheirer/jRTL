@@ -40,8 +40,10 @@ public final class RtlSdr {
     /** Describes the bundled native libraries. Does not load them. */
     public static BuildInfo buildInfo() {
         Properties info = NativeLibraryLoader.buildInfo();
+        String patches = info.getProperty("rtlsdr.patches", "").trim();
         return new BuildInfo(info.getProperty("rtlsdr.ref", "unknown"),
-            info.getProperty("rtlsdr.commit", "unknown"), info.getProperty("libusb.version", "unknown"));
+            info.getProperty("rtlsdr.commit", "unknown"), info.getProperty("libusb.version", "unknown"),
+            patches.isEmpty() ? List.of() : List.of(patches.split(",")));
     }
 
     /**

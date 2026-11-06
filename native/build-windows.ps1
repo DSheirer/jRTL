@@ -48,8 +48,31 @@ $Header = Get-ChildItem -Recurse -Path usb\include -Filter libusb.h | Select-Obj
 if (-not $Header) { throw 'libusb.h not found in the libusb archive' }
 
 Write-Host "=== librtlsdr $Ref ==="
-git -c advice.detachedHead=false clone --quiet --depth 1 --branch $Ref $Versions.RTLSDR_REPOSITORY rtlsdr
+# core.autocrlf=false keeps the upstream sources LF, as the patches are.
+git -c advice.detachedHead=false -c core.autocrlf=false clone --quiet --depth 1 --branch $Ref $Versions.RTLSDR_REPOSITORY rtlsdr
 $Commit = (git -C rtlsdr rev-parse HEAD).Trim()
+
+# jRTL's fixes to upstream, applied in name order. A patch that no longer
+# applies fails the build of the pinned ref. On upstream master it only warns,
+# because upstream may have taken the fix, and the build continues without it.
+$Applied = @()
+foreach ($Patch in Get-ChildItem "$Root\native\patches" -Filter *.patch -ErrorAction SilentlyContinue | Sort-Object Name) {
+    # A failing git throws here, because of $PSNativeCommandUseErrorActionPreference.
+    try {
+        git -C rtlsdr apply $Patch.FullName
+        $Ok = $LASTEXITCODE -eq 0
+    } catch {
+        $Ok = $false
+    }
+    if ($Ok) {
+        $Applied += $Patch.Name
+        Write-Host "Applied $($Patch.Name)"
+    } elseif ($Ref -eq $Versions.RTLSDR_REF) {
+        throw "$($Patch.Name) does not apply to $Ref"
+    } else {
+        Write-Host "::warning::$($Patch.Name) does not apply to $Ref; building without it"
+    }
+}
 
 # Upstream's cmake_minimum_required predates CMP0091, which has to be NEW for
 # CMAKE_MSVC_RUNTIME_LIBRARY to take effect. pkg-config is disabled so upstream
@@ -72,6 +95,7 @@ Copy-Item "$Work\usb\COPYING" "$Licenses\libusb-COPYING" -ErrorAction SilentlyCo
 @(
     "rtlsdr.ref=$Ref",
     "rtlsdr.commit=$Commit",
+    "rtlsdr.patches=$($Applied -join ',')",
     "libusb.version=$LibusbVersion"
 ) | Set-Content -Encoding ascii "$Out\build-info.properties"
 Get-ChildItem $Out
