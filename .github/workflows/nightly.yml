@@ -75,16 +75,15 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
           UPSTREAM: ${{ needs.prepare.outputs.upstream }}
         run: |
-          # librtlsdr is GPL: publish its exact source next to the binaries. The
-          # commit comes from the jar, in case master moved during the build.
-          source native/versions.env
+          # librtlsdr is GPL: publish its exact source, with the jRTL patches
+          # the build applied, next to the binaries. The commit and patches come
+          # from the jar, in case master moved during the build.
           main_jar="$(ls jars/jrtl-*.jar | grep -Ev -- '-(sources|javadoc)\.jar$')"
-          commit="$(unzip -p "$main_jar" jrtl/native/linux-x86_64/build-info.properties |
-            sed -n 's/^rtlsdr.commit=//p')"
-          git init -q upstream
-          git -C upstream fetch -q --depth 1 "$RTLSDR_REPOSITORY" "$commit"
-          git -C upstream archive --prefix="rtl-sdr-blog-${commit::12}/" \
-            -o "$PWD/jars/rtl-sdr-blog-${commit::12}-source.tar.gz" FETCH_HEAD
+          unzip -p "$main_jar" jrtl/native/linux-x86_64/build-info.properties > build-info.properties
+          commit="$(sed -n 's/^rtlsdr.commit=//p' build-info.properties)"
+          patches="$(sed -n 's/^rtlsdr.patches=//p' build-info.properties)"
+          ./native/source-archive.sh build-info.properties "rtl-sdr-blog-${commit::12}" \
+            "jars/rtl-sdr-blog-${commit::12}-source.tar.gz"
           (cd jars && sha256sum * > SHA256SUMS)
           gh release delete nightly --cleanup-tag --yes || true
           gh release create nightly jars/* --prerelease --latest=false \
@@ -92,4 +91,6 @@ jobs:
             --title "Nightly $VERSION" \
             --notes "Automated build of main. Not for production use.
 
-          Built from ${GITHUB_SHA} and rtl-sdr-blog ${UPSTREAM}"
+          Built from ${GITHUB_SHA} and rtl-sdr-blog ${UPSTREAM}
+
+          jRTL patches applied: ${patches:-none}"
