@@ -4,9 +4,9 @@
 #
 # Usage: native/build-unix.sh [rtl-sdr-blog-git-ref]
 #
-# libusb stays a separate shared library because it is LGPL-2.1: keeping it out
-# of librtlsdr lets users replace it. It is built without udev so the Linux
-# binaries do not need libudev at runtime.
+# libusb is built only to link against: at runtime librtlsdr uses the libusb
+# that jlibusb supplies, loaded from the same directory, so the jar does not
+# contain libusb. It is built without udev, as jlibusb's is.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -105,21 +105,19 @@ cmake --build build-rtlsdr --parallel "$JOBS" --target rtlsdr >/dev/null
 
 echo "=== packaging $PLATFORM ==="
 if [ "$OS" = linux ]; then
-    cp -L "$USB_PREFIX/lib/libusb-1.0.so.0" "$OUT/libusb-1.0.so.0"
     cp -L build-rtlsdr/src/librtlsdr.so "$OUT/librtlsdr.so"
     chmod 755 "$OUT"/*
     # Only glibc and libusb may remain as dependencies.
     readelf -d "$OUT/librtlsdr.so" | grep -E 'NEEDED|RUNPATH|RPATH'
 else
-    cp -L "$USB_PREFIX/lib/libusb-1.0.0.dylib" "$OUT/libusb-1.0.0.dylib"
     cp -L build-rtlsdr/src/librtlsdr.dylib "$OUT/librtlsdr.dylib"
     chmod 755 "$OUT"/*
-    # Point librtlsdr at the bundled libusb, not the absolute build path, and
-    # re-sign because install_name_tool invalidates the ad-hoc signatures.
-    install_name_tool -id @rpath/libusb-1.0.0.dylib "$OUT/libusb-1.0.0.dylib"
+    # Point librtlsdr at jlibusb's libusb, which is extracted next to it, not
+    # the absolute build path, and re-sign because install_name_tool
+    # invalidates the ad-hoc signature.
     install_name_tool -id @rpath/librtlsdr.dylib "$OUT/librtlsdr.dylib"
     install_name_tool -change "$USB_LIB" @loader_path/libusb-1.0.0.dylib "$OUT/librtlsdr.dylib"
-    codesign -f -s - "$OUT"/*.dylib
+    codesign -f -s - "$OUT/librtlsdr.dylib"
     otool -L "$OUT/librtlsdr.dylib"
     if otool -L "$OUT/librtlsdr.dylib" | grep -qF "$WORK"; then
         echo "librtlsdr still refers to the build directory" >&2
@@ -135,7 +133,6 @@ if ! "$ROOT/native/check-bindings.sh" rtlsdr/include/rtl-sdr.h; then
 fi
 
 cp rtlsdr/COPYING "$ROOT/dist/native/licenses/rtl-sdr-COPYING"
-cp "libusb-$LIBUSB_VERSION/COPYING" "$ROOT/dist/native/licenses/libusb-COPYING"
 cat > "$OUT/build-info.properties" <<INFO
 rtlsdr.ref=$REF
 rtlsdr.commit=$UPSTREAM_COMMIT
