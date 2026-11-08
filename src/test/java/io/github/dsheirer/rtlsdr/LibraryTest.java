@@ -9,12 +9,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.github.dsheirer.rtlsdr.internal.Native;
 import io.github.dsheirer.rtlsdr.internal.NativeLibraryLoader;
+import io.github.dsheirer.libusb.NativeLoader;
 import java.io.IOException;
 import java.lang.foreign.Arena;
+import java.lang.foreign.FunctionDescriptor;
+import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandle;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.Test;
@@ -96,14 +102,52 @@ class LibraryTest {
     }
 
     @Test
-    void mapsPlatforms() {
-        assertEquals("linux-x86_64", NativeLibraryLoader.platform("Linux", "amd64"));
-        assertEquals("linux-aarch64", NativeLibraryLoader.platform("Linux", "aarch64"));
-        assertEquals("macos-x86_64", NativeLibraryLoader.platform("Mac OS X", "x86_64"));
-        assertEquals("macos-aarch64", NativeLibraryLoader.platform("Mac OS X", "aarch64"));
-        assertEquals("windows-x86_64", NativeLibraryLoader.platform("Windows 11", "amd64"));
-        assertEquals("windows-aarch64", NativeLibraryLoader.platform("Windows 11", "aarch64"));
-        assertThrows(UnsatisfiedLinkError.class, () -> NativeLibraryLoader.platform("Solaris", "amd64"));
-        assertThrows(UnsatisfiedLinkError.class, () -> NativeLibraryLoader.platform("Linux", "riscv64"));
+    void namesLibraries() {
+        assertEquals("librtlsdr.so", NativeLibraryLoader.libraryName("linux-aarch64"));
+        assertEquals("librtlsdr.dylib", NativeLibraryLoader.libraryName("macos-x86_64"));
+        assertEquals("rtlsdr.dll", NativeLibraryLoader.libraryName("windows-aarch64"));
+    }
+
+    @Test
+    void sharesLibusbWithJlibusb() throws Throwable {
+        // Loading librtlsdr loads jlibusb's libusb, so both sit in its directory.
+        assertTrue(RtlSdr.deviceCount() >= 0);
+        Path directory = NativeLoader.directory();
+        String platform = NativeLoader.platform();
+        assertTrue(Files.isRegularFile(directory.resolve(NativeLoader.libusbName(platform))));
+        assertTrue(Files.isRegularFile(directory.resolve(NativeLibraryLoader.libraryName(platform))));
+        if (platform.startsWith("linux")) {
+            // One copy of libusb in the process, the one jlibusb extracted.
+            List<String> mapped = Files.readAllLines(Path.of("/proc/self/maps")).stream()
+                .filter(line -> line.contains("libusb-1.0"))
+                .map(line -> line.substring(line.indexOf('/')))
+                .distinct()
+                .toList();
+            assertEquals(List.of(directory.resolve("libusb-1.0.so.0").toString()), mapped);
+        } else if (platform.startsWith("macos")) {
+            // dyld must reuse the libusb jlibusb loaded when librtlsdr asks for
+            // @loader_path/libusb-1.0.0.dylib, even through the /var symlink.
+            List<String> images = dyldImages().stream().filter(name -> name.contains("libusb-1.0")).toList();
+            assertEquals(1, images.size(), images.toString());
+        }
+    }
+
+    /** Paths of the images dyld has loaded into this process. */
+    private static List<String> dyldImages() throws Throwable {
+        Linker linker = Linker.nativeLinker();
+        SymbolLookup system = linker.defaultLookup();
+        MethodHandle count = linker.downcallHandle(system.find("_dyld_image_count").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_INT));
+        MethodHandle name = linker.downcallHandle(system.find("_dyld_get_image_name").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+        int images = (int) count.invokeExact();
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < images; i++) {
+            MemorySegment pointer = (MemorySegment) name.invokeExact(i);
+            if (!pointer.equals(MemorySegment.NULL)) {
+                names.add(pointer.reinterpret(Long.MAX_VALUE).getString(0));
+            }
+        }
+        return names;
     }
 }
