@@ -109,6 +109,50 @@ class HardwareTest {
         }
     }
 
+    /**
+     * Stops the stream while another thread makes control transfers. That thread
+     * then handles the libusb events, including the completions of the cancelled
+     * bulk transfers, so librtlsdr has to wait for them before freeing the
+     * transfers.
+     */
+    @Test
+    void stopsWhileAnotherThreadMakesControlTransfers() throws Exception {
+        try (RtlSdrDevice device = openConfigured()) {
+            AtomicReference<Throwable> tuningFailure = new AtomicReference<>();
+            AtomicInteger retunes = new AtomicInteger();
+            Thread tuner = new Thread(() -> {
+                long[] frequencies = {FREQUENCY, FREQUENCY + 1_000_000L};
+                while (!Thread.currentThread().isInterrupted()) {
+                    try {
+                        device.setCenterFrequency(frequencies[retunes.getAndIncrement() % 2]);
+                    } catch (Throwable t) {
+                        tuningFailure.compareAndSet(null, t);
+                        return;
+                    }
+                }
+            }, "tuner");
+            tuner.start();
+            try {
+                for (int run = 0; run < 300; run++) {
+                    CountDownLatch received = new CountDownLatch(1 + run % 4);
+                    device.startRx(buffer -> {
+                        received.countDown();
+                        return true;
+                    }, 8, 16384);
+                    assertTrue(received.await(10, TimeUnit.SECONDS), "No samples in run " + run);
+                    device.stopRx();
+                    assertFalse(device.isStreaming());
+                    assertNull(device.streamingFailure(), "Stream failed in run " + run);
+                }
+            } finally {
+                tuner.interrupt();
+                tuner.join();
+            }
+            assertNull(tuningFailure.get());
+            assertTrue(retunes.get() > 20, "Only " + retunes.get() + " retunes");
+        }
+    }
+
     @Test
     void canRestartAfterListenerEndedStream() throws Exception {
         try (RtlSdrDevice device = openConfigured()) {

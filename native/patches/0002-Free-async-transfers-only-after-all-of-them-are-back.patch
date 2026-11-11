@@ -1,0 +1,279 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: denny <dennis.sheirer@gmail.com>
+Date: Wed, 11 Nov 2026 01:47:32 -0500
+Subject: [PATCH] Free async transfers only after all of them are back from
+ libusb
+
+rtlsdr_read_async frees its bulk transfers when the stream ends, but it
+does not wait for every transfer to come back from libusb first. When
+a transfer fails, which on Windows is any status other than completed
+or cancelled, the callback sets dev_lost and cancels the stream. The
+read loop then cancels the transfers, handles one round of events with
+a zero timeout and frees them. The same happens when
+libusb_handle_events_timeout_completed returns an error.
+
+Transfer callbacks run on whichever thread is handling events on the
+context. When the application makes a control transfer from another
+thread while streaming (retuning, for example), that thread can hold
+the event lock. The zero-timeout round on the streaming thread then
+handles nothing, the transfers are freed while their cancellations are
+still pending, and the other thread processes the completions of freed
+transfers. On Windows this crashed in windows_handle_transfer_completion,
+locking the freed transfer's lock:
+
+  ntdll!RtlEnterCriticalSection (write to 0x24, NULL DebugInfo)
+  windows_handle_transfer_completion
+  handle_event_trigger
+  handle_events
+  libusb_handle_events_timeout_completed
+  sync_transfer_wait_for_completion
+  libusb_control_transfer
+  rtlsdr_set_center_freq
+
+Keep a count of transfers in flight, updated atomically because the
+callbacks can run on any thread. Count each transfer before it is
+submitted and stop counting it when the callback does not resubmit it.
+Callbacks no longer resubmit once the stream is ending. When the stream
+ends for any reason, cancel the transfers and handle events until the
+count is zero, then free them. Cancel again on each pass, since a
+callback that was already running when the stream was cancelled can
+resubmit its transfer. If transfers are still in flight after 10 s,
+abandon them and their buffers instead of freeing memory that libusb
+may still write to.
+
+A stream with no transfers left in flight now ends, instead of waiting
+for samples that can't arrive. A stream that ends without
+rtlsdr_cancel_async, because the device was lost, transfers ran out or
+handling events failed, returns LIBUSB_ERROR_IO from rtlsdr_read_async
+instead of 0, so the caller can tell it stopped.
+---
+ src/librtlsdr.c | 146 ++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 103 insertions(+), 43 deletions(-)
+
+diff --git a/src/librtlsdr.c b/src/librtlsdr.c
+index 6d73514..43b6e23 100644
+--- a/src/librtlsdr.c
++++ b/src/librtlsdr.c
+@@ -119,6 +119,14 @@ struct rtlsdr_dev {
+ 	int dev_lost;
+ 	int driver_active;
+ 	unsigned int xfer_errors;
++	/* transfers submitted and not yet handed back to a callback */
++#ifdef _WIN32
++	volatile LONG xfer_active;
++#else
++	int xfer_active;
++#endif
++	/* set when the stream ended for a reason other than rtlsdr_cancel_async */
++	int async_failed;
+ 	char manufact[256];
+ 	char product[256];
+ 	int force_bt;
+@@ -1799,6 +1807,21 @@ int rtlsdr_read_sync(rtlsdr_dev_t *dev, void *buf, int len, int *n_read)
+ 	return libusb_bulk_transfer(dev->devh, 0x81, buf, len, n_read, BULK_TIMEOUT);
+ }
+ 
++/*
++ * Adds to the count of transfers in flight and returns the new count. The
++ * count changes on the thread that submits the transfers and in the transfer
++ * callbacks, which run on whichever thread is handling libusb events, so
++ * the updates have to be atomic.
++ */
++static int _rtlsdr_xfer_active_add(rtlsdr_dev_t *dev, int n)
++{
++#ifdef _WIN32
++	return (int)InterlockedExchangeAdd(&dev->xfer_active, (LONG)n) + n;
++#else
++	return __atomic_add_fetch(&dev->xfer_active, n, __ATOMIC_SEQ_CST);
++#endif
++}
++
+ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
+ {
+ 	rtlsdr_dev_t *dev = (rtlsdr_dev_t *)xfer->user_data;
+@@ -1807,8 +1830,12 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
+ 		if (dev->cb)
+ 			dev->cb(xfer->buffer, xfer->actual_length, dev->cb_ctx);
+ 
+-		libusb_submit_transfer(xfer); /* resubmit transfer */
+ 		dev->xfer_errors = 0;
++
++		/* resubmit the transfer, unless the stream is ending */
++		if (RTLSDR_RUNNING == dev->async_status &&
++		    libusb_submit_transfer(xfer) == 0)
++			return;
+ 	} else if (LIBUSB_TRANSFER_CANCELLED != xfer->status) {
+ #ifndef _WIN32
+ 		if (LIBUSB_TRANSFER_ERROR == xfer->status)
+@@ -1825,6 +1852,15 @@ static void LIBUSB_CALL _libusb_callback(struct libusb_transfer *xfer)
+ 		}
+ #endif
+ 	}
++
++	/* The transfer is no longer in flight. A stream with no transfers
++	 * left would never deliver samples again, so end it. */
++	if (_rtlsdr_xfer_active_add(dev, -1) <= 0 &&
++	    RTLSDR_RUNNING == dev->async_status) {
++		dev->async_failed = 1;
++		rtlsdr_cancel_async(dev);
++		fprintf(stderr, "no transfers left in flight, canceling...\n");
++	}
+ }
+ 
+ int rtlsdr_wait_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx)
+@@ -1950,14 +1986,55 @@ static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev)
+ 	return 0;
+ }
+ 
++/*
++ * Cancels the stream's transfers and handles events until none is in
++ * flight. libusb must not be handed a freed transfer, and the completions
++ * of the cancelled transfers can be handled on another thread that is
++ * handling events on the context, for example one waiting for a control
++ * transfer. One round of events on this thread is then not enough, so wait
++ * for the count of transfers in flight to reach zero.
++ *
++ * Returns 0 when every transfer is back, or -1 if they did not come back in
++ * time, in which case the transfers and their buffers must not be freed.
++ */
++static int _rtlsdr_drain_async(rtlsdr_dev_t *dev)
++{
++	struct timeval tv = { 0, 100000 };
++	unsigned int i;
++	int passes = 0;
++
++	if (!dev->xfer)
++		return 0;
++
++	while (_rtlsdr_xfer_active_add(dev, 0) > 0) {
++		if (++passes > 100) {
++			fprintf(stderr, "%d transfers still in flight after "
++				"canceling, abandoning them\n",
++				_rtlsdr_xfer_active_add(dev, 0));
++			return -1;
++		}
++
++		/* Cancel on each pass, as a callback that was already running
++		 * when the stream was cancelled can resubmit its transfer. A
++		 * transfer that is not in flight or already cancelling is
++		 * left alone by libusb. */
++		for (i = 0; i < dev->xfer_buf_num; ++i) {
++			if (dev->xfer[i])
++				libusb_cancel_transfer(dev->xfer[i]);
++		}
++
++		libusb_handle_events_timeout_completed(dev->ctx, &tv, NULL);
++	}
++
++	return 0;
++}
++
+ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+ 			  uint32_t buf_num, uint32_t buf_len)
+ {
+ 	unsigned int i;
+ 	int r = 0;
+ 	struct timeval tv = { 1, 0 };
+-	struct timeval zerotv = { 0, 0 };
+-	enum rtlsdr_async_status next_status = RTLSDR_INACTIVE;
+ 
+ 	if (!dev)
+ 		return -1;
+@@ -1967,6 +2044,8 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+ 
+ 	dev->async_status = RTLSDR_RUNNING;
+ 	dev->async_cancel = 0;
++	dev->async_failed = 0;
++	dev->xfer_active = 0;
+ 
+ 	dev->cb = cb;
+ 	dev->cb_ctx = ctx;
+@@ -1993,8 +2072,12 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+ 					  (void *)dev,
+ 					  BULK_TIMEOUT);
+ 
++		/* count the transfer first, since another thread that is
++		 * handling events can complete it before submit returns */
++		_rtlsdr_xfer_active_add(dev, 1);
+ 		r = libusb_submit_transfer(dev->xfer[i]);
+ 		if (r < 0) {
++			_rtlsdr_xfer_active_add(dev, -1);
+ 			fprintf(stderr, "Failed to submit transfer %i\n"
+ 					"Please increase your allowed " 
+ 					"usbfs buffer size with the "
+@@ -2006,58 +2089,35 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
+ 		}
+ 	}
+ 
+-	while (RTLSDR_INACTIVE != dev->async_status) {
++	while (RTLSDR_RUNNING == dev->async_status) {
+ 		r = libusb_handle_events_timeout_completed(dev->ctx, &tv,
+ 							   &dev->async_cancel);
+ 		if (r < 0) {
+-			/*fprintf(stderr, "handle_events returned: %d\n", r);*/
+ 			if (r == LIBUSB_ERROR_INTERRUPTED) /* stray signal */
+ 				continue;
++			fprintf(stderr, "handle_events returned: %d, "
++				"canceling...\n", r);
+ 			break;
+ 		}
++	}
+ 
+-		if (RTLSDR_CANCELING == dev->async_status) {
+-			next_status = RTLSDR_INACTIVE;
+-
+-			if (!dev->xfer)
+-				break;
+-
+-			for(i = 0; i < dev->xfer_buf_num; ++i) {
+-				if (!dev->xfer[i])
+-					continue;
+-
+-				if (LIBUSB_TRANSFER_CANCELLED !=
+-						dev->xfer[i]->status) {
+-					r = libusb_cancel_transfer(dev->xfer[i]);
+-					/* handle events after canceling
+-					 * to allow transfer status to
+-					 * propagate */
+-#ifdef _WIN32
+-					Sleep(1);
+-#endif
+-					libusb_handle_events_timeout_completed(dev->ctx,
+-									       &zerotv, NULL);
+-					if (r < 0)
+-						continue;
+-
+-					next_status = RTLSDR_CANCELING;
+-				}
+-			}
++	/* stops the callbacks from resubmitting transfers */
++	dev->async_status = RTLSDR_CANCELING;
+ 
+-			if (dev->dev_lost || RTLSDR_INACTIVE == next_status) {
+-				/* handle any events that still need to
+-				 * be handled before exiting after we
+-				 * just cancelled all transfers */
+-				libusb_handle_events_timeout_completed(dev->ctx,
+-								       &zerotv, NULL);
+-				break;
+-			}
+-		}
++	if (_rtlsdr_drain_async(dev) == 0) {
++		_rtlsdr_free_async_buffers(dev);
++	} else {
++		/* libusb may still write to these, so leak them rather
++		 * than free them, and allocate new ones next time */
++		dev->xfer = NULL;
++		dev->xfer_buf = NULL;
+ 	}
+ 
+-	_rtlsdr_free_async_buffers(dev);
++	/* report a stream that ended without rtlsdr_cancel_async */
++	if (r >= 0 && (dev->dev_lost || dev->async_failed))
++		r = LIBUSB_ERROR_IO;
+ 
+-	dev->async_status = next_status;
++	dev->async_status = RTLSDR_INACTIVE;
+ 
+ 	return r;
+ }
